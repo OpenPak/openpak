@@ -48,6 +48,15 @@ jobs:
           if [ -z "$f" ]; then echo "::error::no manifest in $APP_ID"; exit 1; fi
           echo "manifest=$f" >> "$GITHUB_OUTPUT"
 
+      - name: Ensure tools (rsync)
+        run: |
+          if ! command -v rsync >/dev/null; then
+            dnf install -y rsync 2>/dev/null \
+              || microdnf install -y rsync 2>/dev/null \
+              || { apt-get update && apt-get install -y rsync; }
+          fi
+          rsync --version | head -1
+
       - name: Setup runtimes remote
         run: |
           flatpak remote-add --user --if-not-exists \
@@ -73,6 +82,8 @@ jobs:
           printf '%s\n' "${{ secrets.OPENPAK_GPG_KEY }}" | gpg --batch --import
           mkdir -p repo
           rsync -az "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:${{ secrets.DEPLOY_PATH }}/" repo/ || true
+          # first-ever publish: initialize if the pulled repo is empty
+          [ -f repo/config ] || ostree --repo=repo init --mode=archive-z2
           ostree --repo=repo pull-local local-repo
           flatpak build-update-repo repo \
             --title="Openpak" --generate-static-deltas \

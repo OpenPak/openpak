@@ -52,12 +52,12 @@ jobs:
             page="https://openpak.org/apps/$appid"
             echo "::group::Onboard $appid"
 
-            # 1. create repo if missing; always set About -> app page
+            # 1. create repo if missing; About = app-page link only (no description text)
             if ! gh repo view "$ORG/$appid" >/dev/null 2>&1; then
-              gh repo create "$ORG/$appid" --public --description "$appid" --homepage "$page" >/dev/null
+              gh repo create "$ORG/$appid" --public --homepage "$page" >/dev/null
               echo "created $ORG/$appid"
             fi
-            gh repo edit "$ORG/$appid" --description "$appid" --homepage "$page" >/dev/null || true
+            gh repo edit "$ORG/$appid" --homepage "$page" --description "" >/dev/null || true
 
             # 2. labels: copy shared set, drop GitHub defaults
             gh label list --repo "$INTAKE" --json name,color,description | jq -c '.[]' | while read -r l; do
