@@ -1,0 +1,84 @@
+name: Build & publish
+
+# Per-app repo workflow (seeded by the Openpak onboarding bot).
+# Push to main (or a manifest change) -> build, sign, publish to dl.openpak.org.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.yaml'
+      - '**.yml'
+      - '**.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-24.08
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find manifest
+        id: m
+        run: |
+          f=$(ls *.yaml *.yml *.json 2>/dev/null \
+              | grep -E '^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\.(ya?ml|json)$' | head -1)
+          if [ -z "$f" ]; then echo "::error::no manifest at repo root"; exit 1; fi
+          echo "manifest=$f"  >> "$GITHUB_OUTPUT"
+          echo "appid=${f%.*}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup SSH
+        run: |
+          install -m700 -d ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Build into a local repo
+        run: |
+          flatpak-builder --user --disable-rofiles-fuse --force-clean \
+            --install-deps-from=flathub \
+            --repo=local-repo --default-branch=stable \
+            builddir "${{ steps.m.outputs.manifest }}"
+
+      - name: Acquire publish lock (box mutex)
+        run: |
+          T=600; SSH="ssh ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}"
+          until $SSH "mkdir /home/${{ secrets.DEPLOY_USER }}/openpak/.publish.lock" 2>/dev/null; do
+            T=$((T-10)); [ $T -le 0 ] && { echo "lock timeout"; exit 1; }
+            echo "waiting for publish lock…"; sleep 10
+          done
+          echo "lock acquired"
+
+      - name: Integrate, sign, publish (critical section)
+        run: |
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"; install -m700 -d "$GNUPGHOME"
+          printf '%s\n' "${{ secrets.OPENPAK_GPG_KEY }}" | gpg --batch --import
+          mkdir -p repo
+          rsync -az "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:${{ secrets.DEPLOY_PATH }}/" repo/ || true
+          # pull the freshly built commit(s) into the canonical repo
+          ostree --repo=repo pull-local local-repo
+          flatpak build-update-repo repo \
+            --title="Openpak" --generate-static-deltas \
+            --gpg-sign="${{ secrets.OPENPAK_GPG_KEYID }}" --gpg-homedir="$GNUPGHOME"
+          rsync -az --delete --exclude='tmp/' \
+            repo/ "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:${{ secrets.DEPLOY_PATH }}/"
+
+      - name: Release publish lock
+        if: always()
+        run: |
+          ssh "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+            "rmdir /home/${{ secrets.DEPLOY_USER }}/openpak/.publish.lock" 2>/dev/null || true
+
+      - name: Summary
+        run: echo "Published ${{ steps.m.outputs.appid }} -> https://dl.openpak.org/repo/"

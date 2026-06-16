@@ -1,7 +1,8 @@
 name: Test build (PR gate)
 
-# Submissions PR against `new-pr`. This builds the changed manifest and lints it.
-# No publishing happens here — this is the review gate.
+# Submissions: fork, branch named after the app id, add the manifest at the REPO
+# ROOT as <app-id>.{yaml,yml,json}, open a PR against `new-pr`.
+# This builds + lints it and uploads an installable test bundle. No publishing.
 
 on:
   pull_request:
@@ -21,19 +22,20 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Identify changed manifest
+      - name: Identify submitted manifest
         id: m
         run: |
           git config --global --add safe.directory "$PWD"
           git fetch origin "${{ github.base_ref }}" --depth=1 || true
           f=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD" \
-              | grep -E '^apps/[^/]+/[^/]+\.(ya?ml|json)$' | head -1)
+              | grep -E '^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\.(ya?ml|json)$' | head -1)
           if [ -z "$f" ]; then
-            echo "::error::No app manifest added/changed under apps/<app-id>/"
+            echo "::error::No app manifest found at repo root. Add <app-id>.yaml at the root."
             exit 1
           fi
-          echo "manifest=$f" >> "$GITHUB_OUTPUT"
-          echo "appid=$(basename "$(dirname "$f")")" >> "$GITHUB_OUTPUT"
+          appid="${f%.*}"
+          echo "manifest=$f"   >> "$GITHUB_OUTPUT"
+          echo "appid=$appid"  >> "$GITHUB_OUTPUT"
           echo "Building $f"
 
       - name: Build & lint
@@ -43,3 +45,10 @@ jobs:
           manifest-path: ${{ steps.m.outputs.manifest }}
           cache-key: fb-${{ github.event.pull_request.head.sha }}
           run-tests: false
+
+      - name: Upload test bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.m.outputs.appid }}
+          path: ${{ steps.m.outputs.appid }}.flatpak
+          if-no-files-found: warn

@@ -1,0 +1,88 @@
+name: Onboard app
+
+# On merge into `new-pr`: for each app manifest in the merge, create (or update)
+# the per-app repo OpenPak/<app-id>, seed it with the manifest + per-app build
+# workflow, propagate publishing secrets, copy the shared label set, and let the
+# child repo's own workflow build & publish. Mirrors Flathub's per-app-repo model.
+
+on:
+  push:
+    branches: [new-pr]
+
+permissions:
+  contents: read
+
+jobs:
+  onboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect manifests in this push
+        id: d
+        run: |
+          git config --global --add safe.directory "$PWD"
+          mans=$(git diff --name-only HEAD^ HEAD \
+                 | grep -E '^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\.(ya?ml|json)$' || true)
+          if [ -z "$mans" ]; then
+            echo "No app manifests in this push — nothing to onboard."
+          fi
+          { echo "apps<<EOF"; echo "$mans"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+
+      - name: Create & seed per-app repos
+        if: steps.d.outputs.apps != ''
+        env:
+          GH_TOKEN: ${{ secrets.OPENPAK_BOT_PAT }}
+          ORG: OpenPak
+          INTAKE: ${{ github.repository }}
+          S_GPG_KEY: ${{ secrets.OPENPAK_GPG_KEY }}
+          S_GPG_KEYID: ${{ secrets.OPENPAK_GPG_KEYID }}
+          S_SSH: ${{ secrets.DEPLOY_SSH_KEY }}
+          S_HOST: ${{ secrets.DEPLOY_HOST }}
+          S_USER: ${{ secrets.DEPLOY_USER }}
+          S_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r manifest; do
+            [ -z "$manifest" ] && continue
+            appid="${manifest%.*}"
+            echo "::group::Onboard $appid"
+
+            # 1. create repo if missing
+            if ! gh repo view "$ORG/$appid" >/dev/null 2>&1; then
+              gh repo create "$ORG/$appid" --public \
+                --description "Openpak app: $appid" >/dev/null
+              echo "created $ORG/$appid"
+            fi
+
+            # 2. secrets FIRST (so the child build has them when code lands)
+            for kv in \
+              "OPENPAK_GPG_KEY=$S_GPG_KEY" "OPENPAK_GPG_KEYID=$S_GPG_KEYID" \
+              "DEPLOY_SSH_KEY=$S_SSH" "DEPLOY_HOST=$S_HOST" \
+              "DEPLOY_USER=$S_USER" "DEPLOY_PATH=$S_PATH"; do
+              gh secret set "${kv%%=*}" --repo "$ORG/$appid" --body "${kv#*=}"
+            done
+
+            # 3. copy the shared label set from the intake repo
+            gh label list --repo "$INTAKE" --json name,color,description \
+              | jq -c '.[]' | while read -r l; do
+                n=$(jq -r .name <<<"$l"); c=$(jq -r .color <<<"$l"); d=$(jq -r '.description // ""' <<<"$l")
+                gh label create "$n" --repo "$ORG/$appid" --color "$c" --description "$d" --force >/dev/null 2>&1 || true
+              done
+
+            # 4. seed manifest + per-app workflow + README, push (triggers build)
+            tmp=$(mktemp -d)
+            cp "$manifest" "$tmp/"
+            install -D templates/per-app/build.yml "$tmp/.github/workflows/build.yml"
+            printf '# %s\n\nOpenpak app repository.\nPush a manifest change to rebuild and publish to https://dl.openpak.org/repo/.\n' "$appid" > "$tmp/README.md"
+            ( cd "$tmp"
+              git init -q -b main
+              git config user.name "openpak-bot"; git config user.email "bot@openpak.org"
+              git add -A && git commit -qm "Onboard $appid"
+              git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/$ORG/$appid.git"
+              git push -q -f origin main )
+            echo "seeded & pushed $ORG/$appid"
+            echo "::endgroup::"
+          done <<< "${{ steps.d.outputs.apps }}"

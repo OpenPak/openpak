@@ -2,7 +2,7 @@
 Thanks for submitting an app to Openpak!
 
 Open this pull request against the `new-pr` branch.
-Add your manifest at `apps/<app-id>/<app-id>.{yaml,yml,json}`, on a branch named
+Add your manifest at the repo ROOT as `<app-id>.{yaml,yml,json}`, on a branch named
 after your app id (e.g. `io.github.you.App`).
 
 Submission guide:  ./SUBMISSION.md
@@ -14,7 +14,7 @@ contributions are welcome. We gate on quality, maintenance, and good faith.
 
 - [ ] The PR targets the `new-pr` branch.
 - [ ] The branch is named after the app id, and the manifest lives at
-      `apps/<app-id>/<app-id>.{yaml,yml,json}`.
+      the repo ROOT as `<app-id>.{yaml,yml,json}`.
 - [ ] The app id is a valid reverse-DNS id I control (or that matches the project's
       domain / hosting), e.g. `io.github.you.App`.
 - [ ] The app is free/open-source software, **or** I am the developer (or am

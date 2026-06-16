@@ -24,17 +24,22 @@ rejection and, if repeated, a ban.
 
 ## Manifest requirements
 
-- Place the manifest at `apps/<app-id>/<app-id>.yaml` (or `.yml`/`.json`).
+- Place the manifest at the **repo root** as `<app-id>.{yaml,yml,json}`, on a branch
+  named after the app id.
 - `<app-id>` is your reverse-DNS application id (e.g. `io.github.you.App`).
 - Ship valid AppStream `metainfo` (name, summary, description, license, screenshots)
   and a `.desktop` file + icon — these power the store listing.
+- Pin sources (tag **and** commit, or a checksum) — no moving refs.
 - Request only the permissions the app needs.
 
 ## What CI does
 
-- **On your PR** (`test-build.yml`): builds the changed manifest with
-  `flatpak-builder` and runs `flatpak-builder-lint`. Must pass to be merge-eligible.
-- **On merge to `new-pr`** (`publish.yml`): pulls the current signed repo, builds your
-  app into it, regenerates and **signs** the summary with the Openpak key, and syncs
-  it to `dl.openpak.org`. The private signing key lives only in CI secrets — never in
-  this repo and never on the download host.
+- **On your PR** (`test-build.yml`): builds the root manifest with `flatpak-builder`,
+  runs `flatpak-builder-lint`, and uploads an installable test bundle. Must pass to be
+  merge-eligible.
+- **On merge to `new-pr`** (`onboard.yml`): creates `OpenPak/<app-id>`, seeds it with
+  your manifest + a build workflow, and propagates publishing secrets. That repo then
+  builds your app, **signs** the repo summary with the Openpak repo-signing key, and
+  syncs to `dl.openpak.org`. The private signing key lives only in CI secrets — never
+  committed and never on the download host.
+- **Future updates:** PR/push to `OpenPak/<app-id>` — it rebuilds and republishes.
