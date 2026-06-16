@@ -1,13 +1,18 @@
 name: Onboard app
 
-# On merge into `new-pr`: for each app manifest in the merge, create (or update)
-# the per-app repo OpenPak/<app-id>, seed it with the manifest + per-app build
-# workflow, propagate publishing secrets, copy the shared label set, and let the
-# child repo's own workflow build & publish. Mirrors Flathub's per-app-repo model.
+# On merge into `new-pr`: for each app manifest in the merge, create (or refresh)
+# the per-app repo OpenPak/<app-id> as a MANIFEST-ONLY repo (no README, no
+# workflows — Flathub-faithful), point its About at the app page, copy the shared
+# label set, invite the submitter as maintainer, and dispatch the central build.
 
 on:
   push:
     branches: [new-pr]
+  workflow_dispatch:
+    inputs:
+      app_id:
+        description: Re-onboard a single app id manually
+        required: false
 
 permissions:
   contents: read
@@ -20,81 +25,68 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Detect manifests in this push
+      - name: Detect manifests
         id: d
         run: |
           git config --global --add safe.directory "$PWD"
-          mans=$(git diff --name-only HEAD^ HEAD \
-                 | grep -E '^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\.(ya?ml|json)$' || true)
-          if [ -z "$mans" ]; then
-            echo "No app manifests in this push — nothing to onboard."
+          if [ -n "${{ github.event.inputs.app_id }}" ]; then
+            mans=$(ls "${{ github.event.inputs.app_id }}".* 2>/dev/null | head -1)
+          else
+            mans=$(git diff --name-only HEAD^ HEAD \
+                   | grep -E '^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\.(ya?ml|json)$' || true)
           fi
+          [ -z "$mans" ] && echo "No app manifests to onboard."
           { echo "apps<<EOF"; echo "$mans"; echo "EOF"; } >> "$GITHUB_OUTPUT"
 
-      - name: Create & seed per-app repos
+      - name: Create, seed & build per-app repos
         if: steps.d.outputs.apps != ''
         env:
           GH_TOKEN: ${{ secrets.OPENPAK_BOT_PAT }}
           ORG: OpenPak
           INTAKE: ${{ github.repository }}
-          S_GPG_KEY: ${{ secrets.OPENPAK_GPG_KEY }}
-          S_GPG_KEYID: ${{ secrets.OPENPAK_GPG_KEYID }}
-          S_SSH: ${{ secrets.DEPLOY_SSH_KEY }}
-          S_HOST: ${{ secrets.DEPLOY_HOST }}
-          S_USER: ${{ secrets.DEPLOY_USER }}
-          S_PATH: ${{ secrets.DEPLOY_PATH }}
         run: |
           set -euo pipefail
           while IFS= read -r manifest; do
             [ -z "$manifest" ] && continue
             appid="${manifest%.*}"
+            page="https://openpak.org/apps/$appid"
             echo "::group::Onboard $appid"
 
-            # 1. create repo if missing
+            # 1. create repo if missing; always set About -> app page
             if ! gh repo view "$ORG/$appid" >/dev/null 2>&1; then
-              gh repo create "$ORG/$appid" --public \
-                --description "Openpak app: $appid" >/dev/null
+              gh repo create "$ORG/$appid" --public --description "$appid" --homepage "$page" >/dev/null
               echo "created $ORG/$appid"
             fi
+            gh repo edit "$ORG/$appid" --description "$appid" --homepage "$page" >/dev/null || true
 
-            # 2. secrets FIRST (so the child build has them when code lands)
-            for kv in \
-              "OPENPAK_GPG_KEY=$S_GPG_KEY" "OPENPAK_GPG_KEYID=$S_GPG_KEYID" \
-              "DEPLOY_SSH_KEY=$S_SSH" "DEPLOY_HOST=$S_HOST" \
-              "DEPLOY_USER=$S_USER" "DEPLOY_PATH=$S_PATH"; do
-              gh secret set "${kv%%=*}" --repo "$ORG/$appid" --body "${kv#*=}"
+            # 2. labels: copy shared set, drop GitHub defaults
+            gh label list --repo "$INTAKE" --json name,color,description | jq -c '.[]' | while read -r l; do
+              n=$(jq -r .name <<<"$l"); c=$(jq -r .color <<<"$l"); d=$(jq -r '.description // ""' <<<"$l")
+              gh label create "$n" --repo "$ORG/$appid" --color "$c" --description "$d" --force >/dev/null 2>&1 || true
+            done
+            for x in bug documentation "good first issue" "help wanted" question wontfix; do
+              gh label delete "$x" --repo "$ORG/$appid" --yes >/dev/null 2>&1 || true
             done
 
-            # 3. copy the shared label set from the intake repo
-            gh label list --repo "$INTAKE" --json name,color,description \
-              | jq -c '.[]' | while read -r l; do
-                n=$(jq -r .name <<<"$l"); c=$(jq -r .color <<<"$l"); d=$(jq -r '.description // ""' <<<"$l")
-                gh label create "$n" --repo "$ORG/$appid" --color "$c" --description "$d" --force >/dev/null 2>&1 || true
-              done
-
-            # 4. seed manifest + per-app workflow + README, push (triggers build)
-            tmp=$(mktemp -d)
-            cp "$manifest" "$tmp/"
-            install -D templates/per-app/build.yml "$tmp/.github/workflows/build.yml"
-            printf '# %s\n\nOpenpak app repository.\nPush a manifest change to rebuild and publish to https://dl.openpak.org/repo/.\n' "$appid" > "$tmp/README.md"
+            # 3. seed MANIFEST ONLY (no README, no workflows)
+            tmp=$(mktemp -d); cp "$manifest" "$tmp/"
             ( cd "$tmp"
               git init -q -b main
               git config user.name "openpak-bot"; git config user.email "bot@openpak.org"
-              git add -A && git commit -qm "Onboard $appid"
+              git add -A && git commit -qm "Add $appid"
               git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/$ORG/$appid.git"
               git push -q -f origin main )
-            echo "seeded & pushed $ORG/$appid"
+            echo "seeded $ORG/$appid (manifest only)"
 
-            # 5. invite the PR submitter as maintainer of their app repo
-            author=$(gh api "repos/$INTAKE/commits/${{ github.sha }}/pulls" \
-                       --jq '.[0].user.login' 2>/dev/null || true)
+            # 4. invite the PR submitter as maintainer
+            author=$(gh api "repos/$INTAKE/commits/${{ github.sha }}/pulls" --jq '.[0].user.login' 2>/dev/null || true)
             if [ -n "$author" ] && [ "$author" != "null" ]; then
-              gh api -X PUT "repos/$ORG/$appid/collaborators/$author" \
-                -f permission=push >/dev/null \
-                && echo "invited $author as maintainer of $ORG/$appid" \
-                || echo "could not invite $author"
-            else
-              echo "submitter not resolved from merge commit — skipping invite"
+              gh api -X PUT "repos/$ORG/$appid/collaborators/$author" -f permission=push >/dev/null \
+                && echo "invited $author" || echo "invite failed for $author"
             fi
+
+            # 5. dispatch the central build
+            gh workflow run build-app.yml --repo "$INTAKE" -f app_id="$appid" \
+              && echo "dispatched build for $appid"
             echo "::endgroup::"
           done <<< "${{ steps.d.outputs.apps }}"

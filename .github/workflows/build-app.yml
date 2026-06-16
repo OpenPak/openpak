@@ -1,22 +1,28 @@
-name: Build & publish
+name: Build app
 
-# Per-app repo workflow (seeded by the Openpak onboarding bot).
-# Push to main (or a manifest change) -> build, sign, publish to dl.openpak.org.
+# Central build service (Flathub-faithful). Per-app repos hold ONLY the manifest;
+# this workflow builds any app and publishes it to dl.openpak.org.
+#
+# Triggered by:
+#   - onboard.yml (workflow_dispatch) right after a per-app repo is created
+#   - repository_dispatch {type: build-app, client_payload.app_id} on per-app push
+#     (wired via an org webhook -> dispatcher; see deploy/ for the receiver)
+#   - manual: gh workflow run build-app.yml -f app_id=<app-id>
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - '**.yaml'
-      - '**.yml'
-      - '**.json'
   workflow_dispatch:
+    inputs:
+      app_id:
+        description: Reverse-DNS app id (the per-app repo name)
+        required: true
+  repository_dispatch:
+    types: [build-app]
 
 permissions:
   contents: read
 
 concurrency:
-  group: publish-${{ github.repository }}
+  group: openpak-publish        # one publisher mutates the shared repo at a time
   cancel-in-progress: false
 
 jobs:
@@ -25,17 +31,27 @@ jobs:
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-24.08
       options: --privileged
+    env:
+      APP_ID: ${{ github.event.inputs.app_id || github.event.client_payload.app_id }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout app repo
+        uses: actions/checkout@v4
+        with:
+          repository: OpenPak/${{ github.event.inputs.app_id || github.event.client_payload.app_id }}
+          token: ${{ secrets.OPENPAK_BOT_PAT }}
 
       - name: Find manifest
         id: m
         run: |
           f=$(ls *.yaml *.yml *.json 2>/dev/null \
               | grep -E '^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\.(ya?ml|json)$' | head -1)
-          if [ -z "$f" ]; then echo "::error::no manifest at repo root"; exit 1; fi
-          echo "manifest=$f"  >> "$GITHUB_OUTPUT"
-          echo "appid=${f%.*}" >> "$GITHUB_OUTPUT"
+          if [ -z "$f" ]; then echo "::error::no manifest in $APP_ID"; exit 1; fi
+          echo "manifest=$f" >> "$GITHUB_OUTPUT"
+
+      - name: Setup runtimes remote
+        run: |
+          flatpak remote-add --user --if-not-exists \
+            flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 
       - name: Setup SSH
         run: |
@@ -51,22 +67,12 @@ jobs:
             --repo=local-repo --default-branch=stable \
             builddir "${{ steps.m.outputs.manifest }}"
 
-      - name: Acquire publish lock (box mutex)
-        run: |
-          T=600; SSH="ssh ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}"
-          until $SSH "mkdir /home/${{ secrets.DEPLOY_USER }}/openpak/.publish.lock" 2>/dev/null; do
-            T=$((T-10)); [ $T -le 0 ] && { echo "lock timeout"; exit 1; }
-            echo "waiting for publish lock…"; sleep 10
-          done
-          echo "lock acquired"
-
-      - name: Integrate, sign, publish (critical section)
+      - name: Integrate, sign, publish
         run: |
           export GNUPGHOME="$RUNNER_TEMP/gnupg"; install -m700 -d "$GNUPGHOME"
           printf '%s\n' "${{ secrets.OPENPAK_GPG_KEY }}" | gpg --batch --import
           mkdir -p repo
           rsync -az "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:${{ secrets.DEPLOY_PATH }}/" repo/ || true
-          # pull the freshly built commit(s) into the canonical repo
           ostree --repo=repo pull-local local-repo
           flatpak build-update-repo repo \
             --title="Openpak" --generate-static-deltas \
@@ -74,11 +80,5 @@ jobs:
           rsync -az --delete --exclude='tmp/' \
             repo/ "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:${{ secrets.DEPLOY_PATH }}/"
 
-      - name: Release publish lock
-        if: always()
-        run: |
-          ssh "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
-            "rmdir /home/${{ secrets.DEPLOY_USER }}/openpak/.publish.lock" 2>/dev/null || true
-
       - name: Summary
-        run: echo "Published ${{ steps.m.outputs.appid }} -> https://dl.openpak.org/repo/"
+        run: echo "Published $APP_ID -> https://dl.openpak.org/repo/"
