@@ -1,0 +1,45 @@
+name: Test build (PR gate)
+
+# Submissions PR against `new-pr`. This builds the changed manifest and lints it.
+# No publishing happens here — this is the review gate.
+
+on:
+  pull_request:
+    branches: [new-pr]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-24.08
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Identify changed manifest
+        id: m
+        run: |
+          git config --global --add safe.directory "$PWD"
+          git fetch origin "${{ github.base_ref }}" --depth=1 || true
+          f=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD" \
+              | grep -E '^apps/[^/]+/[^/]+\.(ya?ml|json)$' | head -1)
+          if [ -z "$f" ]; then
+            echo "::error::No app manifest added/changed under apps/<app-id>/"
+            exit 1
+          fi
+          echo "manifest=$f" >> "$GITHUB_OUTPUT"
+          echo "appid=$(basename "$(dirname "$f")")" >> "$GITHUB_OUTPUT"
+          echo "Building $f"
+
+      - name: Build & lint
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: ${{ steps.m.outputs.appid }}.flatpak
+          manifest-path: ${{ steps.m.outputs.manifest }}
+          cache-key: fb-${{ github.event.pull_request.head.sha }}
+          run-tests: false

@@ -1,0 +1,87 @@
+name: Publish
+
+# Runs on merge into `new-pr`. Builds the app into the live signed repo, signs the
+# summary with the Openpak repo-signing key (CI secret only), and syncs to dl box.
+#
+# Required repo/org secrets:
+#   OPENPAK_GPG_KEY        armored PRIVATE repo-signing key (passphrase-less)
+#   OPENPAK_GPG_KEYID      the signing key id / fingerprint
+#   DEPLOY_SSH_KEY         private SSH key authorized on the dl box
+#   DEPLOY_HOST            145.241.199.19
+#   DEPLOY_USER            ubuntu
+#   DEPLOY_PATH            /home/ubuntu/openpak/deploy/data/repo
+
+on:
+  push:
+    branches: [new-pr]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openpak-publish      # serialize: one publisher mutates the repo at a time
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-24.08
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Identify manifest
+        id: m
+        run: |
+          git config --global --add safe.directory "$PWD"
+          f=$(git diff --name-only HEAD^ HEAD \
+              | grep -E '^apps/[^/]+/[^/]+\.(ya?ml|json)$' | head -1)
+          if [ -z "$f" ]; then echo "::error::no manifest changed in merge"; exit 1; fi
+          echo "manifest=$f" >> "$GITHUB_OUTPUT"
+          echo "appid=$(basename "$(dirname "$f")")" >> "$GITHUB_OUTPUT"
+
+      - name: Setup SSH
+        run: |
+          install -m700 -d ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Pull current signed repo
+        run: |
+          mkdir -p repo
+          rsync -az "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:${{ secrets.DEPLOY_PATH }}/" repo/ || true
+
+      - name: Import signing key
+        run: |
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          install -m700 -d "$GNUPGHOME"
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          printf '%s\n' "${{ secrets.OPENPAK_GPG_KEY }}" | gpg --batch --import
+
+      - name: Build into the repo
+        run: |
+          flatpak-builder --user --disable-rofiles-fuse --force-clean \
+            --install-deps-from=flathub \
+            --repo=repo --default-branch=stable \
+            builddir "${{ steps.m.outputs.manifest }}"
+
+      - name: Sign & regenerate summary + static deltas
+        run: |
+          flatpak build-update-repo repo \
+            --title="Openpak" \
+            --generate-static-deltas \
+            --gpg-sign="${{ secrets.OPENPAK_GPG_KEYID }}" \
+            --gpg-homedir="$GNUPGHOME"
+
+      - name: Publish to dl box
+        run: |
+          rsync -az --delete \
+            --exclude='tmp/' \
+            repo/ "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:${{ secrets.DEPLOY_PATH }}/"
+
+      - name: Summary
+        run: echo "Published ${{ steps.m.outputs.appid }} to https://dl.openpak.org/repo/"
