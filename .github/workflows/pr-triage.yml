@@ -1,0 +1,113 @@
+name: PR intake triage
+
+# Runs in the BASE repo context (write token) so it can comment + close PRs
+# coming from forks. We never check out or run the PR's code — only read its
+# title/body metadata — so pull_request_target is safe here.
+on:
+  pull_request_target:
+    types: [opened]
+    branches: [new-pr]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  triage:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const title = (pr.title || "").trim();
+            const body = pr.body || "";
+
+            // Maintainer escape hatch: add this label to skip auto-close.
+            const BYPASS = "override-triage";
+            if ((pr.labels || []).some(l => l.name === BYPASS)) {
+              core.info("override-triage label present — skipping triage.");
+              return;
+            }
+
+            const failures = [];
+
+            // 1. Title must be exactly: Add <app-id>  (reverse-DNS, 3+ segments)
+            const titleRe = /^Add\s+([A-Za-z][A-Za-z0-9_-]*(?:\.[A-Za-z][A-Za-z0-9_-]*){2,})$/;
+            const m = title.match(titleRe);
+            let appId = null;
+            if (!m) {
+              failures.push(
+                "**PR title** must be exactly `Add <app-id>` — e.g. `Add org.openpaks.Example`.\n" +
+                "  Yours: `" + (title || "(empty)") + "`"
+              );
+            } else {
+              appId = m[1];
+            }
+
+            // 2. A video of the app running on Linux via the Flatpak must be present.
+            const videoRe = /(https?:\/\/\S+\.(?:webm|mp4|mov|ogv|m4v|mkv)\b)|(github\.com\/user-attachments\/assets\/)|(\.githubusercontent\.com\/\S+\.(?:webm|mp4|mov))|(youtube\.com\/watch|youtu\.be\/|vimeo\.com\/|peertube)/i;
+            if (!videoRe.test(body)) {
+              failures.push(
+                "**No video found.** Attach a screencast of the app running on Linux via the " +
+                "Flatpak (drag a `.webm`/`.mp4` into the PR description) or paste a link to one."
+              );
+            }
+
+            // 3. The domain the app-id maps to must actually exist.
+            //    org.openpaks.Example -> openpaks.org  (segments[1].segments[0])
+            if (appId) {
+              const segs = appId.split(".");
+              const domain = (segs[1] + "." + segs[0]).toLowerCase();
+              const dns = require("dns").promises;
+              let exists = false;
+              try {
+                const ns = await dns.resolveNs(domain);
+                exists = Array.isArray(ns) && ns.length > 0;
+              } catch (e) {
+                try {
+                  const a = await dns.resolve(domain);
+                  exists = Array.isArray(a) && a.length > 0;
+                } catch (e2) {
+                  exists = false;
+                }
+              }
+              if (!exists) {
+                failures.push(
+                  "**Domain `" + domain + "` does not appear to exist.** The app id `" + appId +
+                  "` maps to the domain `" + domain + "`, which must be a real, registered domain " +
+                  "you control (or a code-hosting domain such as `github.io`). No DNS records were found for it."
+                );
+              }
+            }
+
+            if (failures.length === 0) {
+              core.info("Triage passed.");
+              return;
+            }
+
+            const msg = [
+              "Thanks for the submission! This PR was **automatically closed** because it did not pass intake checks:",
+              "",
+              ...failures.map(f => "- " + f),
+              "",
+              "---",
+              "Fix the above and open a new pull request against `new-pr`. " +
+                "See the [submission guide](https://docs.openpak.org/docs/for-app-authors/submission).",
+              "",
+              "_Openpak judges the work, not the workflow — AI-assisted and AI-generated apps are welcome._",
+            ].join("\n");
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              body: msg,
+            });
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              state: "closed",
+            });
+            core.setFailed("PR closed by intake triage: " + failures.length + " issue(s).");
